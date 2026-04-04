@@ -492,3 +492,105 @@ def test_offer_launch_chat_manual_fallback_when_unresolvable(monkeypatch, capsys
 
     captured = capsys.readouterr()
     assert "Run 'hermes chat' manually" in captured.out
+
+def test_vercel_setup_persists_runtime_and_oidc_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("VERCEL_OIDC_TOKEN", raising=False)
+    config = load_config()
+
+    def fake_prompt_choice(question, choices, default=0):
+        if question == "Select terminal backend:":
+            return 5
+        if question == "Select Vercel Sandbox credential mode:":
+            return 0
+        raise AssertionError(f"Unexpected prompt_choice call: {question}")
+
+    prompt_values = iter(["oidc-token-123", "python3.13"])
+
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: next(prompt_values))
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
+    monkeypatch.setattr("hermes_cli.setup._prompt_container_resources", lambda *args, **kwargs: None)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name == "vercel" else None)
+
+    from hermes_cli.setup import setup_terminal_backend
+
+    setup_terminal_backend(config)
+
+    assert config["terminal"]["backend"] == "vercel_sandbox"
+    assert config["terminal"]["vercel_runtime"] == "python3.13"
+    env_content = (tmp_path / ".env").read_text()
+    assert "VERCEL_OIDC_TOKEN=oidc-token-123" in env_content
+    assert "TERMINAL_VERCEL_RUNTIME=python3.13" in env_content
+
+
+def test_vercel_setup_clears_token_tuple_when_switching_to_oidc(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("VERCEL_OIDC_TOKEN", raising=False)
+    monkeypatch.setenv("VERCEL_TOKEN", "stale-token")
+    monkeypatch.setenv("VERCEL_PROJECT_ID", "stale-project")
+    monkeypatch.setenv("VERCEL_TEAM_ID", "stale-team")
+    config = load_config()
+
+    def fake_prompt_choice(question, choices, default=0):
+        if question == "Select terminal backend:":
+            return 5
+        if question == "Select Vercel Sandbox credential mode:":
+            return 0
+        raise AssertionError(f"Unexpected prompt_choice call: {question}")
+
+    prompt_values = iter(["oidc-token-123", "python3.13", "yes", "2", "4096"])
+    prompt_messages = []
+
+    def fake_prompt(message, *args, **kwargs):
+        prompt_messages.append(message)
+        return next(prompt_values)
+
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr("hermes_cli.setup.prompt", fake_prompt)
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name == "vercel" else None)
+
+    from hermes_cli.setup import setup_terminal_backend
+
+    setup_terminal_backend(config)
+
+    env_content = (tmp_path / ".env").read_text()
+    assert "VERCEL_OIDC_TOKEN=oidc-token-123" in env_content
+    assert "VERCEL_TOKEN=\n" in env_content
+    assert "VERCEL_PROJECT_ID=\n" in env_content
+    assert "VERCEL_TEAM_ID=\n" in env_content
+    assert all("Disk in MB" not in message for message in prompt_messages)
+
+
+def test_vercel_setup_clears_oidc_when_switching_to_api_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("VERCEL_OIDC_TOKEN", "stale-oidc")
+    monkeypatch.delenv("VERCEL_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
+    monkeypatch.delenv("VERCEL_TEAM_ID", raising=False)
+    config = load_config()
+
+    def fake_prompt_choice(question, choices, default=0):
+        if question == "Select terminal backend:":
+            return 5
+        if question == "Select Vercel Sandbox credential mode:":
+            return 1
+        raise AssertionError(f"Unexpected prompt_choice call: {question}")
+
+    prompt_values = iter(["api-token-123", "project-123", "team-123", "node22", "yes", "1", "2048"])
+
+    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: next(prompt_values))
+    monkeypatch.setattr("hermes_cli.setup.prompt_yes_no", lambda *args, **kwargs: False)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name == "vercel" else None)
+
+    from hermes_cli.setup import setup_terminal_backend
+
+    setup_terminal_backend(config)
+
+    env_content = (tmp_path / ".env").read_text()
+    assert "VERCEL_OIDC_TOKEN=\n" in env_content
+    assert "VERCEL_TOKEN=api-token-123" in env_content
+    assert "VERCEL_PROJECT_ID=project-123" in env_content
+    assert "VERCEL_TEAM_ID=team-123" in env_content

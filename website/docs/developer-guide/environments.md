@@ -84,7 +84,7 @@ The foundation from `atroposlib`. Provides:
 ### HermesAgentBaseEnv
 
 The hermes-agent layer (`environments/hermes_base_env.py`). Adds:
-- **Terminal backend configuration** — sets `TERMINAL_ENV` for sandboxed execution (local, Docker, Modal, Daytona, SSH, Singularity)
+- **Terminal backend configuration** — sets `TERMINAL_ENV` for sandboxed execution (local, Docker, Modal, Daytona, Vercel Sandbox, SSH, Singularity)
 - **Tool resolution** — `_resolve_tools_for_group()` calls hermes-agent's `get_tool_definitions()` to get the right tool schemas based on enabled/disabled toolsets
 - **Agent loop integration** — `collect_trajectory()` runs `HermesAgentLoop` and scores the result
 - **Two-phase operation** — Phase 1 (OpenAI server) for eval/SFT, Phase 2 (VLLM ManagedServer) for full RL with logprobs

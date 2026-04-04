@@ -14,15 +14,15 @@
 
           # Composite stamp: changes when nix python or uv change
           STAMP_VALUE="${python}:${pkgs.uv}"
-          STAMP_FILE=".venv/.nix-stamp"
+          STAMP_FILE="venv/.nix-stamp"
 
           # Create venv if missing
-          if [ ! -d .venv ]; then
+          if [ ! -d venv ]; then
             echo "Creating Python 3.11 venv..."
-            uv venv .venv --python ${python}/bin/python3
+            uv venv venv --python ${python}/bin/python3
           fi
 
-          source .venv/bin/activate
+          source venv/bin/activate
 
           # Only install if stamp is stale or missing
           if [ ! -f "$STAMP_FILE" ] || [ "$(cat "$STAMP_FILE")" != "$STAMP_VALUE" ]; then

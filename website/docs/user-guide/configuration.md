@@ -75,20 +75,21 @@ For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-ho
 
 ## Terminal Backend Configuration
 
-Hermes supports six terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox, a Daytona workspace, or a Singularity/Apptainer container.
+Hermes supports seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox, a Daytona workspace, a Vercel Sandbox, or a Singularity/Apptainer container.
 
 ```yaml
 terminal:
-  backend: local    # local | docker | ssh | modal | daytona | singularity
+  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity
   cwd: "."          # Working directory ("." = current dir for local, "/root" for containers)
   timeout: 180      # Per-command timeout in seconds
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
   modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"                 # Container image for Modal backend
   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Container image for Daytona backend
+  vercel_runtime: "node22"                                                  # Runtime for Vercel Sandbox
 ```
 
-For cloud sandboxes such as Modal and Daytona, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
+For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
 
 ### Backend Overview
 
@@ -99,6 +100,7 @@ For cloud sandboxes such as Modal and Daytona, `container_persistent: true` mean
 | **ssh** | Remote server via SSH | Network boundary | Remote dev, powerful hardware |
 | **modal** | Modal cloud sandbox | Full (cloud VM) | Ephemeral cloud compute, evals |
 | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
+| **vercel_sandbox** | Vercel Sandbox | Full (cloud sandbox) | Fast ephemeral cloud execution with snapshot-backed persistence |
 | **singularity** | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
 
 ### Local Backend
@@ -213,6 +215,31 @@ terminal:
 
 **Disk limit:** Daytona enforces a 10 GiB maximum. Requests above this are capped with a warning.
 
+### Vercel Sandbox Backend
+
+Runs commands in a [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) managed cloud sandbox. Hermes supports runtime selection plus snapshot-backed filesystem persistence.
+
+**Install support:** Use the Hermes Vercel extra: `pip install 'hermes-agent[vercel]'`. From a source checkout, install with `uv pip install -e ".[vercel]"`.
+
+```yaml
+terminal:
+  backend: vercel_sandbox
+  vercel_runtime: "node22"          # Or e.g. "python3.13"
+  container_cpu: 1                  # CPU cores
+  container_memory: 2048            # MB; must equal container_cpu * 2048
+  container_persistent: true        # Snapshot/restore filesystem between sessions
+```
+
+**Required credentials:** Use either `VERCEL_OIDC_TOKEN`, or set all three of `VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, and `VERCEL_TEAM_ID`.
+
+**Runtime selection:** `terminal.vercel_runtime` controls the runtime Hermes requests from Vercel. The same value is also bridged to `TERMINAL_VERCEL_RUNTIME` for env-based configuration flows.
+
+**Resource sizing:** Vercel currently requires `container_memory` to equal `container_cpu * 2048` MB. Hermes normalizes the shared generic `5120 MB` default to the required Vercel value, but custom mismatches fail clearly.
+
+**Persistence:** When enabled, Hermes snapshots filesystem state on cleanup and attempts restore by `task_id` on the next session. This preserves files when snapshot restore succeeds, but it does not guarantee the same live sandbox, process table, or background jobs survive cleanup.
+
+**Disk sizing:** Hermes intentionally does not support configurable `container_disk` for `vercel_sandbox`. The shared default disk value is treated as unset, but any non-default `container_disk` request fails clearly instead of being silently ignored.
+
 ### Singularity/Apptainer Backend
 
 Runs commands in a [Singularity/Apptainer](https://apptainer.org) container. Designed for HPC clusters and shared machines where Docker isn't available.
@@ -243,6 +270,7 @@ If terminal commands fail immediately or the terminal tool is reported as disabl
 - **SSH** — Both `TERMINAL_SSH_HOST` and `TERMINAL_SSH_USER` must be set. Hermes logs a clear error if either is missing.
 - **Modal** — Needs `MODAL_TOKEN_ID` env var or `~/.modal.toml`. Run `hermes doctor` to check.
 - **Daytona** — Needs `DAYTONA_API_KEY`. The Daytona SDK handles server URL configuration.
+- **Vercel Sandbox** — Needs either `VERCEL_OIDC_TOKEN`, or `VERCEL_TOKEN` plus `VERCEL_PROJECT_ID` plus `VERCEL_TEAM_ID`.
 - **Singularity** — Needs `apptainer` or `singularity` in `$PATH`. Common on HPC clusters.
 
 When in doubt, set `terminal.backend` back to `local` and verify that commands run there first.

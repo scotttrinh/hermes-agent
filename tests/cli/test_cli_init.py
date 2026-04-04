@@ -272,6 +272,31 @@ class TestRootLevelProviderOverride:
 
         assert cfg["model"]["provider"] == "openrouter"
 
+
+def test_load_cli_config_bridges_vercel_runtime(monkeypatch, tmp_path):
+    import importlib
+    import yaml
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_VERCEL_RUNTIME", raising=False)
+
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"terminal": {"backend": "vercel_sandbox", "vercel_runtime": "python3.13"}})
+    )
+
+    import cli
+
+    cli = importlib.reload(cli)
+    monkeypatch.setattr(cli, "_hermes_home", hermes_home)
+    cfg = cli.load_cli_config()
+
+    assert cfg["terminal"]["backend"] == "vercel_sandbox"
+    assert os.environ["TERMINAL_ENV"] == "vercel_sandbox"
+    assert os.environ["TERMINAL_VERCEL_RUNTIME"] == "python3.13"
+
     def test_root_provider_ignored_when_default_model_provider_exists(self, tmp_path, monkeypatch):
         """Even when model.provider is the default 'auto', root-level provider is ignored."""
         import yaml

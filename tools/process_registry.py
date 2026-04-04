@@ -33,17 +33,28 @@ import json
 import logging
 import os
 import platform
-import shlex
 import signal
 import subprocess
 import threading
 import time
 import uuid
-
-_IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+_IS_WINDOWS = platform.system() == "Windows"
+from tools.background_supervisor import BackgroundSupervisor
+from tools.environments.background_contracts import (
+    DetachedCommandErrorResult,
+    DetachedCommandExitedResult,
+    DetachedCommandKilledResult,
+    DetachedCommandResult,
+    get_backend_background_checkpoint_backend,
+)
+from tools.environments.local import _find_shell, _sanitize_subprocess_env
+from tools.environments.local import LocalEnvironment
+from tools.environments.recovery_registry import (
+    get_environment_class_for_background_backend,
+)
 
 from hermes_cli.config import get_hermes_home
 
@@ -98,6 +109,8 @@ class ProcessSession:
     _watch_disabled: bool = field(default=False, repr=False) # permanently killed by overload
     _watch_window_hits: int = field(default=0, repr=False)   # hits in current rate window
     _watch_window_start: float = field(default=0.0, repr=False)
+    background_adapter: Any = None             # Non-local background process adapter
+    background_adapter: Any = None             # Non-local background process adapter
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
@@ -125,6 +138,7 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._background_supervisor = BackgroundSupervisor()
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -280,6 +294,42 @@ class ProcessRegistry:
         except (OSError, ProcessLookupError, PermissionError):
             os.kill(pid, signal.SIGTERM)
 
+    def _sync_env_session_result(self, session: ProcessSession, result: Optional[DetachedCommandResult]) -> None:
+        """Merge an environment-backed adapter result into the tracked session state."""
+        if not result:
+            return
+
+        with session._lock:
+            if result.pid is not None:
+                session.pid = result.pid
+
+            full_output = result.output
+            if full_output is None and isinstance(result, DetachedCommandErrorResult):
+                full_output = result.error
+            if full_output is not None:
+                session.output_buffer = str(full_output)[-session.max_output_chars:]
+            elif result.output_delta:
+                session.output_buffer += str(result.output_delta)
+                if len(session.output_buffer) > session.max_output_chars:
+                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+
+            if isinstance(
+                result,
+                (DetachedCommandExitedResult, DetachedCommandKilledResult, DetachedCommandErrorResult),
+            ):
+                session.exited = True
+                session.exit_code = result.exit_code
+
+        if session.exited:
+            self._move_to_finished(session)
+
+    def _handle_background_adapter_failure(self, session: ProcessSession, error: Exception) -> None:
+        session.exited = True
+        session.exit_code = -1
+        with session._lock:
+            session.output_buffer = f"{session.output_buffer}\nBackground poll failed: {error}".strip()
+        self._move_to_finished(session)
+
     # ----- Spawn -----
 
     @staticmethod
@@ -419,13 +469,9 @@ class ProcessRegistry:
         """
         Spawn a background process through a non-local environment backend.
 
-        For Docker/Singularity/Modal/Daytona/SSH: runs the command inside the sandbox
-        using the environment's execute() interface. We wrap the command to
-        capture the in-sandbox PID and redirect output to a log file inside
-        the sandbox, then poll the log via subsequent execute() calls.
-
-        This is less capable than local spawn (no live stdout pipe, no stdin),
-        but it ensures the command runs in the correct sandbox context.
+        The environment owns detached-process adapter selection. Backends can
+        return native adapters with checkpoint-aware recovery metadata or fall
+        back to the shell-emulation adapter that wraps execute().
         """
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
@@ -438,51 +484,22 @@ class ProcessRegistry:
             pid_scope="sandbox",
         )
 
-        # Run the command in the sandbox with output capture
-        temp_dir = self._env_temp_dir(env)
-        log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
-        pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
-        exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
-        quoted_command = shlex.quote(command)
-        quoted_temp_dir = shlex.quote(temp_dir)
-        quoted_log_path = shlex.quote(log_path)
-        quoted_pid_path = shlex.quote(pid_path)
-        quoted_exit_path = shlex.quote(exit_path)
-        bg_command = (
-            f"mkdir -p {quoted_temp_dir} && "
-            f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+        session.background_adapter = env.create_background_process_adapter(
+            command=command,
+            session_id=session.id,
+            cwd=cwd,
         )
-
         try:
-            result = env.execute(bg_command, timeout=timeout)
-            output = result.get("output", "").strip()
-            # Try to extract the PID from the output
-            for line in output.splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    session.pid = int(line)
-                    break
+            result = session.background_adapter.spawn(timeout=timeout)
+            self._sync_env_session_result(session, result)
         except Exception as e:
             session.exited = True
             session.exit_code = -1
             session.output_buffer = f"Failed to start: {e}"
-
-        if not session.exited:
-            # Start a poller thread that periodically reads the log file
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
-
         with self._lock:
             self._prune_if_needed()
-            self._running[session.id] = session
+            target = self._finished if session.exited else self._running
+            target[session.id] = session
 
         self._write_checkpoint()
         return session
@@ -516,59 +533,6 @@ class ProcessRegistry:
             session.exited = True
             session.exit_code = session.process.returncode
             self._move_to_finished(session)
-
-    def _env_poller_loop(
-        self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
-    ):
-        """Background thread: poll a sandbox log file for non-local backends."""
-        quoted_log_path = shlex.quote(log_path)
-        quoted_pid_path = shlex.quote(pid_path)
-        quoted_exit_path = shlex.quote(exit_path)
-        prev_output_len = 0  # track delta for watch pattern scanning
-        while not session.exited:
-            time.sleep(2)  # Poll every 2 seconds
-            try:
-                # Read new output from the log file
-                result = env.execute(f"cat {quoted_log_path} 2>/dev/null", timeout=10)
-                new_output = result.get("output", "")
-                if new_output:
-                    # Compute delta for watch pattern scanning
-                    delta = new_output[prev_output_len:] if len(new_output) > prev_output_len else ""
-                    prev_output_len = len(new_output)
-                    with session._lock:
-                        session.output_buffer = new_output
-                        if len(session.output_buffer) > session.max_output_chars:
-                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
-                    if delta:
-                        self._check_watch_patterns(session, delta)
-
-                # Check if process is still running
-                check = env.execute(
-                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
-                    timeout=5,
-                )
-                check_output = check.get("output", "").strip()
-                if check_output and check_output.splitlines()[-1].strip() != "0":
-                    # Process has exited -- get exit code captured by the wrapper shell.
-                    exit_result = env.execute(
-                        f"cat {quoted_exit_path} 2>/dev/null",
-                        timeout=5,
-                    )
-                    exit_str = exit_result.get("output", "").strip()
-                    try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
-                    except (ValueError, IndexError):
-                        session.exit_code = -1
-                    session.exited = True
-                    self._move_to_finished(session)
-                    return
-
-            except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited = True
-                session.exit_code = -1
-                self._move_to_finished(session)
-                return
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -608,6 +572,7 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        self._background_supervisor.unregister(session.id)
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
@@ -639,6 +604,20 @@ class ProcessRegistry:
             session = self._running.get(session_id) or self._finished.get(session_id)
         return self._refresh_detached_session(session)
 
+    def ensure_background_monitor(self, session_id: str) -> bool:
+        """Start detached-session monitoring for watcher-driven non-local sessions."""
+        session = self.get(session_id)
+        if session is None or session.exited or session.background_adapter is None:
+            return False
+
+        self._background_supervisor.monitor_session(
+            session,
+            get_session=self.get,
+            sync_result=self._sync_env_session_result,
+            handle_failure=self._handle_background_adapter_failure,
+        )
+        return True
+
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
         from tools.ansi_strip import strip_ansi
@@ -646,6 +625,17 @@ class ProcessRegistry:
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        if session.background_adapter and not session.exited:
+            try:
+                adapter_result = self._background_supervisor.call_adapter(session, "poll", timeout=5)
+                self._sync_env_session_result(session, adapter_result)
+            except Exception as e:
+                session.exited = True
+                session.exit_code = -1
+                with session._lock:
+                    session.output_buffer = f"{session.output_buffer}\nBackground poll failed: {e}".strip()
+                self._move_to_finished(session)
 
         with session._lock:
             output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
@@ -673,6 +663,13 @@ class ProcessRegistry:
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        if session.background_adapter and not session.exited:
+            try:
+                adapter_result = self._background_supervisor.call_adapter(session, "poll", timeout=5)
+                self._sync_env_session_result(session, adapter_result)
+            except Exception:
+                pass
 
         with session._lock:
             full_output = strip_ansi(session.output_buffer)
@@ -737,6 +734,21 @@ class ProcessRegistry:
 
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
+            if session.background_adapter and not session.exited:
+                try:
+                    remaining = max(1, int(deadline - time.monotonic()))
+                    adapter_result = self._background_supervisor.call_adapter(
+                        session,
+                        "wait",
+                        timeout=min(5, remaining),
+                    )
+                    self._sync_env_session_result(session, adapter_result)
+                except Exception as e:
+                    session.exited = True
+                    session.exit_code = -1
+                    with session._lock:
+                        session.output_buffer = f"{session.output_buffer}\nBackground wait failed: {e}".strip()
+                    self._move_to_finished(session)
             if session.exited:
                 self._completion_consumed.add(session_id)
                 result = {
@@ -800,9 +812,9 @@ class ProcessRegistry:
                         os.killpg(os.getpgid(session.process.pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
                     session.process.kill()
-            elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            elif session.background_adapter:
+                adapter_result = self._background_supervisor.call_adapter(session, "kill", timeout=5)
+                self._sync_env_session_result(session, adapter_result)
             elif session.detached and session.pid_scope == "host" and session.pid:
                 if not self._is_host_pid_alive(session.pid):
                     with session._lock:
@@ -822,9 +834,10 @@ class ProcessRegistry:
                         "its original runtime handle is no longer available"
                     ),
                 }
-            session.exited = True
-            session.exit_code = -15  # SIGTERM
-            self._move_to_finished(session)
+            if not session.exited:
+                session.exited = True
+                session.exit_code = -15  # SIGTERM
+                self._move_to_finished(session)
             self._write_checkpoint()
             return {"status": "killed", "session_id": session.id}
         except Exception as e:
@@ -1004,6 +1017,10 @@ class ProcessRegistry:
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
                         })
+                        if s.background_adapter and hasattr(s.background_adapter, "checkpoint_data"):
+                            checkpoint = s.background_adapter.checkpoint_data()
+                            if checkpoint:
+                                entries[-1]["background_checkpoint"] = checkpoint.to_json()
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
@@ -1027,6 +1044,89 @@ class ProcessRegistry:
 
         recovered = 0
         for entry in entries:
+            raw_background_checkpoint = entry.get("background_checkpoint")
+            backend = get_backend_background_checkpoint_backend(raw_background_checkpoint)
+            if backend:
+                try:
+                    env_cls = get_environment_class_for_background_backend(backend)
+                    if env_cls is None:
+                        raise ValueError(
+                            f"Unsupported background checkpoint backend: {backend}"
+                        )
+
+                    background_checkpoint = env_cls.parse_background_checkpoint(
+                        raw_background_checkpoint
+                    )
+                    env, adapter = env_cls.recover_background_session(background_checkpoint)
+
+                    session = ProcessSession(
+                        id=entry["session_id"],
+                        command=background_checkpoint.command,
+                        task_id=entry.get("task_id", ""),
+                        session_key=entry.get("session_key", ""),
+                        pid=entry.get("pid"),
+                        env_ref=env,
+                        cwd=entry.get("cwd"),
+                        started_at=entry.get("started_at", time.time()),
+                        watcher_platform=entry.get("watcher_platform", ""),
+                        watcher_chat_id=entry.get("watcher_chat_id", ""),
+                        watcher_user_id=entry.get("watcher_user_id", ""),
+                        watcher_user_name=entry.get("watcher_user_name", ""),
+                        watcher_thread_id=entry.get("watcher_thread_id", ""),
+                        watcher_interval=entry.get("watcher_interval", 0),
+                        notify_on_complete=entry.get("notify_on_complete", False),
+                        watch_patterns=entry.get("watch_patterns", []),
+                        background_adapter=adapter,
+                    )
+                    with self._lock:
+                        self._running[session.id] = session
+                    if session.watcher_interval > 0:
+                        self.ensure_background_monitor(session.id)
+                    recovered += 1
+                    logger.info(
+                        "Recovered background process from backend checkpoint: %s (%s)",
+                        session.command[:60],
+                        background_checkpoint.backend,
+                    )
+                    if session.watcher_interval > 0:
+                        self.pending_watchers.append({
+                            "session_id": session.id,
+                            "check_interval": session.watcher_interval,
+                            "session_key": session.session_key,
+                            "platform": session.watcher_platform,
+                            "chat_id": session.watcher_chat_id,
+                            "user_id": session.watcher_user_id,
+                            "user_name": session.watcher_user_name,
+                            "thread_id": session.watcher_thread_id,
+                            "notify_on_complete": session.notify_on_complete,
+                        })
+                    continue
+                except Exception as exc:
+                    # Fall back to the legacy pid-only recovery path below. This
+                    # preserves main-branch behavior for non-local backends that
+                    # cannot yet reconstruct a backend-owned adapter after restart.
+                    #
+                    # To get Vercel-like recovery here, a backend needs:
+                    # 1. create_background_process_adapter() at spawn time,
+                    # 2. checkpoint_data() with durable backend identity, and
+                    # 3. recover_background_session() that reattaches and
+                    #    returns the matching environment/adapter pair.
+                    #
+                    # Until a backend implements that contract, Hermes can only
+                    # attempt best-effort detached recovery from a stored pid.
+                    logger.warning(
+                        "Failed to recover background process from backend checkpoint %s: %s; "
+                        "falling back to pid-only detached recovery",
+                        entry.get("session_id", "unknown"),
+                        exc,
+                    )
+            elif raw_background_checkpoint is not None:
+                logger.warning(
+                    "Ignoring invalid background checkpoint for %s; "
+                    "falling back to pid-only detached recovery",
+                    entry.get("session_id", "unknown"),
+                )
+
             pid = entry.get("pid")
             if not pid:
                 continue

@@ -91,6 +91,13 @@ class TestCatchAllPatterns:
         env_content = _read_env(_isolated_hermes_home)
         assert "TERMINAL_SSH_PORT=2222" in env_content
 
+    def test_vercel_project_and_team_ids_route_to_env(self, _isolated_hermes_home):
+        set_config_value("VERCEL_PROJECT_ID", "prj_123")
+        set_config_value("VERCEL_TEAM_ID", "team_456")
+        env_content = _read_env(_isolated_hermes_home)
+        assert "VERCEL_PROJECT_ID=prj_123" in env_content
+        assert "VERCEL_TEAM_ID=team_456" in env_content
+
 
 # ---------------------------------------------------------------------------
 # Non-secret keys → config.yaml
@@ -126,6 +133,13 @@ class TestConfigYamlRouting:
             "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true" in env_content
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
+
+    def test_terminal_vercel_runtime_goes_to_config_and_env(self, _isolated_hermes_home):
+        set_config_value("terminal.vercel_runtime", "python3.13")
+        config = _read_config(_isolated_hermes_home)
+        env_content = _read_env(_isolated_hermes_home)
+        assert "vercel_runtime: python3.13" in config
+        assert "TERMINAL_VERCEL_RUNTIME=python3.13" in env_content
 
 
 # ---------------------------------------------------------------------------

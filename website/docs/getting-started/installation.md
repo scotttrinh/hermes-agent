@@ -139,6 +139,7 @@ uv pip install -e "."
 | `cron` | Cron expression parsing for scheduled tasks | `uv pip install -e ".[cron]"` |
 | `cli` | Terminal menu UI for setup wizard | `uv pip install -e ".[cli]"` |
 | `modal` | Modal cloud execution backend | `uv pip install -e ".[modal]"` |
+| `vercel` | Vercel Sandbox backend support | `uv pip install -e ".[vercel]"` |
 | `tts-premium` | ElevenLabs premium voices | `uv pip install -e ".[tts-premium]"` |
 | `voice` | CLI microphone input + audio playback | `uv pip install -e ".[voice]"` |
 | `pty` | PTY terminal support | `uv pip install -e ".[pty]"` |
@@ -155,6 +156,8 @@ You can combine extras: `uv pip install -e ".[messaging,cron]"`
 :::tip Termux users
 `.[all]` is not currently available on Android because the `voice` extra pulls `faster-whisper`, which depends on `ctranslate2` wheels that are not published for Android. Use `.[termux]` for the tested mobile install path, then add individual extras only as needed.
 :::
+
+For Vercel Sandbox specifically, the supported install path is `uv pip install -e ".[vercel]"` from a source checkout, or `pip install 'hermes-agent[vercel]'` from PyPI.
 
 </details>
 

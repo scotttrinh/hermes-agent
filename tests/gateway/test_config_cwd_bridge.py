@@ -33,6 +33,7 @@ def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
             "backend": "TERMINAL_ENV",
             "cwd": "TERMINAL_CWD",
             "timeout": "TERMINAL_TIMEOUT",
+            "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
         }
         for cfg_key, env_var in terminal_env_map.items():
             if cfg_key in terminal_cfg:
@@ -151,7 +152,6 @@ class TestTopLevelCwdAlias:
         result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/from/env"})
         assert result["TERMINAL_CWD"] == "/from/config"
 
-
 class TestNestedTerminalCwdPlaceholderSkip:
     """terminal.cwd placeholder values must not clobber TERMINAL_CWD.
 
@@ -205,3 +205,9 @@ class TestNestedTerminalCwdPlaceholderSkip:
         assert result["TERMINAL_ENV"] == "docker"
         assert result["TERMINAL_TIMEOUT"] == "300"
         assert result["TERMINAL_CWD"] == "/from/env"
+
+    def test_terminal_vercel_runtime_sets_terminal_env_var(self):
+        cfg = {"terminal": {"backend": "vercel_sandbox", "vercel_runtime": "python3.13"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_ENV"] == "vercel_sandbox"
+        assert result["TERMINAL_VERCEL_RUNTIME"] == "python3.13"

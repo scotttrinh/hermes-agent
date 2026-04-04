@@ -571,8 +571,8 @@ def _print_setup_summary(config: dict, hermes_home):
     print()
 
 
-def _prompt_container_resources(config: dict):
-    """Prompt for container resource settings (Docker, Singularity, Modal, Daytona)."""
+def _prompt_container_resources(config: dict, *, allow_disk: bool = True):
+    """Prompt for container resource settings for containerized backends."""
     terminal = config.setdefault("terminal", {})
 
     print()
@@ -604,13 +604,16 @@ def _prompt_container_resources(config: dict):
     except ValueError:
         pass
 
-    # Disk
-    current_disk = terminal.get("container_disk", 51200)
-    disk_str = prompt("  Disk in MB (51200 = 50GB)", str(current_disk))
-    try:
-        terminal["container_disk"] = int(disk_str)
-    except ValueError:
-        pass
+    if allow_disk:
+        current_disk = terminal.get("container_disk", 51200)
+        disk_str = prompt("  Disk in MB (51200 = 50GB)", str(current_disk))
+        try:
+            terminal["container_disk"] = int(disk_str)
+        except ValueError:
+            pass
+    else:
+        terminal.pop("container_disk", None)
+        print_info("  Disk sizing is fixed for Vercel Sandbox; Hermes will use the shared default.")
 
 
 # Tool categories and provider config are now in tools_config.py (shared
@@ -1094,11 +1097,12 @@ def setup_terminal_backend(config: dict):
         "Modal - serverless cloud sandbox",
         "SSH - run on a remote machine",
         "Daytona - persistent cloud development environment",
+        "Vercel Sandbox - ephemeral cloud sandbox",
     ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona"}
-    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4}
+    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "vercel_sandbox"}
+    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "vercel_sandbox": 5}
 
-    next_idx = 5
+    next_idx = 6
     if is_linux:
         terminal_choices.append("Singularity/Apptainer - HPC-friendly container")
         idx_to_backend[next_idx] = "singularity"
@@ -1352,6 +1356,103 @@ def setup_terminal_backend(config: dict):
         save_env_value("TERMINAL_DAYTONA_IMAGE", image)
 
         _prompt_container_resources(config)
+
+    elif selected_backend == "vercel_sandbox":
+        print_success("Terminal backend: Vercel Sandbox")
+        print_info("Ephemeral Vercel cloud sandboxes for shell-based Hermes execution.")
+        print_info("Use either OIDC auth or an API token paired with project/team IDs.")
+
+        try:
+            import importlib.util
+            vercel_sdk_ok = importlib.util.find_spec("vercel") is not None
+        except Exception:
+            vercel_sdk_ok = False
+
+        if not vercel_sdk_ok:
+            print_info("Installing Vercel Sandbox dependency...")
+            import subprocess
+
+            uv_bin = shutil.which("uv")
+            if uv_bin:
+                result = subprocess.run(
+                    [uv_bin, "pip", "install", "--python", sys.executable, "vercel"],
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "vercel"],
+                    capture_output=True,
+                    text=True,
+                )
+            if result.returncode == 0:
+                print_success("vercel SDK installed")
+            else:
+                print_warning("Install failed — run manually: pip install 'hermes-agent[vercel]'")
+                if result.stderr:
+                    print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
+
+        print()
+        existing_oidc = get_env_value("VERCEL_OIDC_TOKEN")
+        existing_token = get_env_value("VERCEL_TOKEN")
+        existing_project = get_env_value("VERCEL_PROJECT_ID")
+        existing_team = get_env_value("VERCEL_TEAM_ID")
+        credential_choices = [
+            "Use OIDC token",
+            "Use API token + project/team IDs",
+        ]
+        default_credential_idx = 0 if existing_oidc else 1 if (existing_token or existing_project or existing_team) else 0
+        credential_idx = prompt_choice(
+            "Select Vercel Sandbox credential mode:",
+            credential_choices,
+            default_credential_idx,
+        )
+
+        if credential_idx == 0:
+            save_env_value("VERCEL_TOKEN", "")
+            save_env_value("VERCEL_PROJECT_ID", "")
+            save_env_value("VERCEL_TEAM_ID", "")
+            if existing_oidc:
+                print_info("  Vercel OIDC token: already configured")
+                if prompt_yes_no("  Update OIDC token?", False):
+                    oidc_token = prompt("    Vercel OIDC token", password=True)
+                    if oidc_token:
+                        save_env_value("VERCEL_OIDC_TOKEN", oidc_token)
+                        print_success("    Updated")
+            else:
+                oidc_token = prompt("    Vercel OIDC token", password=True)
+                if oidc_token:
+                    save_env_value("VERCEL_OIDC_TOKEN", oidc_token)
+                    print_success("    Configured")
+        else:
+            save_env_value("VERCEL_OIDC_TOKEN", "")
+            if existing_token:
+                print_info("  Vercel API token: already configured")
+                if prompt_yes_no("  Update API token?", False):
+                    api_token = prompt("    Vercel API token", password=True)
+                    if api_token:
+                        save_env_value("VERCEL_TOKEN", api_token)
+                        print_success("    Updated")
+            else:
+                api_token = prompt("    Vercel API token", password=True)
+                if api_token:
+                    save_env_value("VERCEL_TOKEN", api_token)
+                    print_success("    Configured")
+
+            project_id = prompt("    Vercel project ID", existing_project or "")
+            if project_id:
+                save_env_value("VERCEL_PROJECT_ID", project_id)
+
+            team_id = prompt("    Vercel team ID", existing_team or "")
+            if team_id:
+                save_env_value("VERCEL_TEAM_ID", team_id)
+
+        current_runtime = config.get("terminal", {}).get("vercel_runtime", "node22")
+        runtime = prompt("  Vercel runtime", current_runtime)
+        config["terminal"]["vercel_runtime"] = runtime
+        save_env_value("TERMINAL_VERCEL_RUNTIME", runtime)
+
+        _prompt_container_resources(config, allow_disk=False)
 
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")

@@ -10,7 +10,17 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from tools.environments.background_contracts import (
+    DetachedCommandErrorResult,
+    DetachedCommandExitedResult,
+    DetachedCommandKilledResult,
+    DetachedCommandRunningResult,
+    DetachedCommandSpawnResult,
+)
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+from tools.background_process_adapters import (
+    ShellEnvironmentBackgroundAdapter,
+)
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
@@ -340,66 +350,311 @@ class TestSpawnEnvSanitization:
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
-    def test_spawn_via_env_uses_backend_temp_dir_for_artifacts(self, registry):
-        class FakeEnv:
+# =========================================================================
+# Native environment background hooks
+# =========================================================================
+
+class _NativeEnv:
+    def __init__(self):
+        self.execute = MagicMock()
+        self.spawn_background_process = MagicMock(return_value=DetachedCommandSpawnResult(
+            handle="cmd_123",
+            pid=321,
+            output="booting\n",
+        ))
+        self.poll_background_process = MagicMock(return_value=DetachedCommandRunningResult(
+            output="booting\nstill running\n",
+        ))
+        self.wait_background_process = MagicMock(return_value=DetachedCommandExitedResult(
+            exit_code=0,
+            output="booting\ndone\n",
+        ))
+        self.kill_background_process = MagicMock(return_value=DetachedCommandKilledResult(
+            output="terminated\n",
+        ))
+        self.serialize_background_handle = MagicMock(
+            side_effect=lambda handle, *, command: type(
+                "Checkpoint",
+                (),
+                {
+                    "backend": "vercel_sandbox",
+                    "command": command,
+                    "to_json": staticmethod(
+                        lambda: {
+                            "backend": "vercel_sandbox",
+                            "command": command,
+                            "sandbox_id": "sb_123",
+                            "command_id": "cmd_123",
+                            "runtime": "python3.13",
+                            "cwd": "/workspace",
+                            "timeout": 30,
+                            "task_id": "task-1",
+                            "persistent_filesystem": True,
+                            "resource_constraints": {"cpu": 1, "disk": 51200},
+                        }
+                    ),
+                },
+            )()
+        )
+        self.create_background_process_adapter = MagicMock(
+            side_effect=lambda *, command, session_id, cwd: _EnvOwnedBackgroundAdapter(
+                env=self,
+                command=command,
+                cwd=cwd or "",
+            )
+        )
+
+
+class _EnvOwnedBackgroundAdapter:
+    def __init__(self, *, env, command, cwd, handle=None):
+        self.env = env
+        self.command = command
+        self.cwd = cwd
+        self.handle = handle
+
+    def spawn(self, timeout):
+        result = self.env.spawn_background_process(self.command, cwd=self.cwd, timeout=timeout)
+        self.handle = result.handle
+        return result
+
+    def poll(self, timeout):
+        return self.env.poll_background_process(self.handle, timeout=timeout)
+
+    def wait(self, timeout):
+        return self.env.wait_background_process(self.handle, timeout=timeout)
+
+    def kill(self, timeout):
+        return self.env.kill_background_process(self.handle, timeout=timeout)
+
+    def checkpoint_data(self):
+        if self.handle is None:
+            return None
+        return self.env.serialize_background_handle(self.handle, command=self.command)
+
+
+class TestNativeBackgroundProcesses:
+    def test_spawn_via_env_uses_environment_owned_adapter(self, registry):
+        env = _NativeEnv()
+
+        with patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "pytest -q", cwd="/workspace", task_id="task-1")
+
+        assert isinstance(session.background_adapter, _EnvOwnedBackgroundAdapter)
+        assert session.background_adapter.handle == "cmd_123"
+        assert session.pid == 321
+        assert session.output_buffer.startswith("booting\n")
+        assert registry.get(session.id) is session
+        env.create_background_process_adapter.assert_called_once_with(
+            command="pytest -q",
+            session_id=session.id,
+            cwd="/workspace",
+        )
+        env.spawn_background_process.assert_called_once_with("pytest -q", cwd="/workspace", timeout=10)
+        env.execute.assert_not_called()
+
+    def test_poll_native_process_refreshes_output(self, registry):
+        env = _NativeEnv()
+        session = _make_session(output="old")
+        session.env_ref = env
+        session.background_adapter = _EnvOwnedBackgroundAdapter(
+            env=env,
+            command="pytest -q",
+            cwd="/workspace",
+            handle="cmd_123",
+        )
+        registry._running[session.id] = session
+
+        result = registry.poll(session.id)
+
+        assert result["status"] == "running"
+        assert "still running" in result["output_preview"]
+        env.poll_background_process.assert_called_once_with("cmd_123", timeout=5)
+
+    def test_wait_native_process_uses_backend_wait_hook(self, registry):
+        env = _NativeEnv()
+        session = _make_session(output="old")
+        session.env_ref = env
+        session.background_adapter = _EnvOwnedBackgroundAdapter(
+            env=env,
+            command="pytest -q",
+            cwd="/workspace",
+            handle="cmd_123",
+        )
+        registry._running[session.id] = session
+
+        result = registry.wait(session.id, timeout=2)
+
+        assert result["status"] == "exited"
+        assert result["exit_code"] == 0
+        assert "done" in result["output"]
+        env.wait_background_process.assert_called()
+        assert session.id in registry._finished
+
+    def test_kill_native_process_uses_backend_kill_hook(self, registry):
+        env = _NativeEnv()
+        session = _make_session()
+        session.env_ref = env
+        session.background_adapter = _EnvOwnedBackgroundAdapter(
+            env=env,
+            command="pytest -q",
+            cwd="/workspace",
+            handle="cmd_123",
+        )
+        registry._running[session.id] = session
+
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed"
+        env.kill_background_process.assert_called_once_with("cmd_123", timeout=5)
+        assert session.exit_code == -15
+        assert session.id in registry._finished
+
+    def test_native_spawn_failure_is_captured(self, registry):
+        env = _NativeEnv()
+        env.spawn_background_process.side_effect = RuntimeError("backend unavailable")
+
+        with patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "pytest -q")
+
+        assert session.exited is True
+        assert session.exit_code == -1
+        assert "backend unavailable" in session.output_buffer
+        assert session.id in registry._finished
+
+    def test_ensure_background_monitor_starts_automatic_poller_for_non_local_sessions(
+        self, registry, monkeypatch
+    ):
+        env = _NativeEnv()
+        env.poll_background_process.side_effect = [
+            DetachedCommandRunningResult(output="booting\nstill running\n"),
+            DetachedCommandExitedResult(exit_code=0, output="booting\ndone\n"),
+        ]
+        monkeypatch.setattr("tools.process_registry.time.sleep", lambda _seconds: None)
+
+        class _ImmediateThread:
+            def __init__(self, *, target, args, **_kwargs):
+                self._target = target
+                self._args = args
+                self.started = False
+
+            def start(self):
+                self.started = True
+                self._target(*self._args)
+
+            def is_alive(self):
+                return False
+
+        created_threads = []
+
+        def _make_thread(*_args, **kwargs):
+            thread = _ImmediateThread(**kwargs)
+            created_threads.append(thread)
+            return thread
+
+        with patch("threading.Thread", side_effect=_make_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "pytest -q", cwd="/workspace", task_id="task-1")
+            started = registry.ensure_background_monitor(session.id)
+
+        assert started is True
+        assert created_threads
+        assert session.exited is True
+        assert session.exit_code == 0
+        assert "done" in session.output_buffer
+        assert session.id in registry._finished
+        assert env.poll_background_process.call_count == 2
+
+
+class TestShellBackgroundAdapterResults:
+    def test_spawn_returns_typed_running_result(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "4321\n", "returncode": 0}
+        adapter = ShellEnvironmentBackgroundAdapter(env=env, command="pytest -q", session_id="proc_123")
+
+        result = adapter.spawn(timeout=10)
+
+        assert isinstance(result, DetachedCommandSpawnResult)
+        assert result.pid == 4321
+
+    def test_spawn_returns_typed_error_when_pid_missing(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "not-a-pid\n", "returncode": 0}
+        adapter = ShellEnvironmentBackgroundAdapter(env=env, command="pytest -q", session_id="proc_123")
+
+        result = adapter.spawn(timeout=10)
+
+        assert isinstance(result, DetachedCommandErrorResult)
+        assert result.error == "Shell background spawn did not return a pid"
+
+    def test_poll_returns_typed_exit_result(self):
+        env = MagicMock()
+        env.execute.side_effect = [
+            {"output": "done\n", "returncode": 0},
+            {"output": "1\n", "returncode": 0},
+            {"output": "0\n", "returncode": 0},
+        ]
+        adapter = ShellEnvironmentBackgroundAdapter(
+            env=env,
+            command="pytest -q",
+            session_id="proc_123",
+            pid=4321,
+            log_path="/tmp/hermes_bg_proc_123.log",
+            pid_path="/tmp/hermes_bg_proc_123.pid",
+        )
+
+        result = adapter.poll(timeout=10)
+
+        assert isinstance(result, DetachedCommandExitedResult)
+        assert result.exit_code == 0
+
+    def test_kill_returns_typed_error_when_pid_missing(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        adapter = ShellEnvironmentBackgroundAdapter(env=env, command="pytest -q", session_id="proc_123")
+
+        result = adapter.kill(timeout=10)
+
+        assert isinstance(result, DetachedCommandErrorResult)
+        assert result.error == "Shell background kill could not resolve pid"
+
+    def test_spawn_via_env_falls_back_to_shell_emulation_without_native_hooks(self, registry):
+        class _FallbackEnv:
             def __init__(self):
-                self.commands = []
+                self.execute = MagicMock(return_value={"output": "4321\n", "returncode": 0})
 
-            def get_temp_dir(self):
-                return "/data/data/com.termux/files/usr/tmp"
+            def create_background_process_adapter(self, *, command, session_id, cwd):
+                return ShellEnvironmentBackgroundAdapter(
+                    env=self,
+                    command=command,
+                    session_id=session_id,
+                )
 
-            def execute(self, command, timeout=None):
-                self.commands.append((command, timeout))
-                return {"output": "4321\n"}
-
-        env = FakeEnv()
+        env = _FallbackEnv()
         fake_thread = MagicMock()
 
-        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+        with patch("threading.Thread", return_value=fake_thread), \
             patch.object(registry, "_write_checkpoint"):
-            session = registry.spawn_via_env(env, "echo hello")
+            session = registry.spawn_via_env(env, "pytest -q", cwd="/workspace")
 
-        bg_command = env.commands[0][0]
+        assert isinstance(session.background_adapter, ShellEnvironmentBackgroundAdapter)
         assert session.pid == 4321
-        assert "/data/data/com.termux/files/usr/tmp/hermes_bg_" in bg_command
-        assert ".exit" in bg_command
-        assert "rc=$?;" in bg_command
-        assert " > /tmp/hermes_bg_" not in bg_command
-        assert "cat /tmp/hermes_bg_" not in bg_command
-        fake_thread.start.assert_called_once()
+        env.execute.assert_called_once()
+        assert "nohup bash -c" in env.execute.call_args.args[0]
 
-    def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
-        session = _make_session(sid="proc_space")
-        session.exited = False
+    def test_native_recovery_uses_vercel_recovery_contract(self, monkeypatch):
+        recover_mock = MagicMock(return_value=("env", {"owner": "VercelSandboxEnvironment"}))
+        fake_backend = type("FakeBackend", (), {"recover_background_session": recover_mock})
+        monkeypatch.setattr(
+            "tools.environments.vercel_sandbox.VercelSandboxEnvironment",
+            fake_backend,
+        )
 
-        class FakeEnv:
-            def __init__(self):
-                self.commands = []
-                self._responses = iter([
-                    {"output": "hello\n"},
-                    {"output": "1\n"},
-                    {"output": "0\n"},
-                ])
+        checkpoint = {"backend": "vercel_sandbox", "command_id": "cmd_123"}
+        env, adapter = fake_backend.recover_background_session(checkpoint)
 
-            def execute(self, command, timeout=None):
-                self.commands.append((command, timeout))
-                return next(self._responses)
-
-        env = FakeEnv()
-
-        with patch("tools.process_registry.time.sleep", return_value=None), \
-            patch.object(registry, "_move_to_finished"):
-            registry._env_poller_loop(
-                session,
-                env,
-                "/path with spaces/hermes_bg.log",
-                "/path with spaces/hermes_bg.pid",
-                "/path with spaces/hermes_bg.exit",
-            )
-
-        assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
-        assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert env == "env"
+        assert adapter == {"owner": "VercelSandboxEnvironment"}
+        recover_mock.assert_called_once_with(checkpoint)
 
 
 # =========================================================================
@@ -453,6 +708,30 @@ class TestCheckpoint:
             assert data[0]["watcher_user_name"] == "alice"
             assert data[0]["watcher_thread_id"] == "42"
             assert data[0]["watcher_interval"] == 60
+
+    def test_write_checkpoint_includes_native_background_checkpoint(self, registry, tmp_path):
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
+            env = _NativeEnv()
+            session = _make_session()
+            session.env_ref = env
+            session.background_adapter = _EnvOwnedBackgroundAdapter(
+                env=env,
+                command="pytest -q",
+                cwd="/workspace",
+                handle="cmd_123",
+            )
+            registry._running[session.id] = session
+
+            registry._write_checkpoint()
+
+            data = json.loads((tmp_path / "procs.json").read_text())
+            assert data[0]["background_checkpoint"]["backend"] == "vercel_sandbox"
+            assert data[0]["background_checkpoint"]["command"] == "pytest -q"
+            assert data[0]["background_checkpoint"]["command_id"] == "cmd_123"
+            assert data[0]["background_checkpoint"]["resource_constraints"] == {
+                "cpu": 1,
+                "disk": 51200,
+            }
 
     def test_recover_enqueues_watchers(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
@@ -577,6 +856,133 @@ class TestCheckpoint:
                 except Exception:
                     proc.kill()
                     proc.wait(timeout=5)
+
+    def test_recover_native_background_process(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_native",
+            "command": "python server.py",
+            "cwd": "/workspace",
+            "task_id": "task-1",
+            "session_key": "sk1",
+            "watcher_platform": "telegram",
+            "watcher_chat_id": "123",
+            "watcher_thread_id": "42",
+            "watcher_interval": 60,
+                "background_checkpoint": {
+                    "backend": "vercel_sandbox",
+                    "command": "python server.py",
+                    "sandbox_id": "sb_123",
+                    "command_id": "cmd_123",
+                    "runtime": "python3.13",
+                    "cwd": "/workspace",
+                    "timeout": 30,
+                    "task_id": "task-1",
+                    "persistent_filesystem": True,
+                    "resource_constraints": {"cpu": 1, "disk": 51200},
+                },
+            }]))
+        recovered_adapter = _EnvOwnedBackgroundAdapter(
+            env=MagicMock(),
+            command="python server.py",
+            cwd="/workspace",
+            handle="cmd_123",
+        )
+        recovered_env = recovered_adapter.env
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+            patch(
+                "tools.environments.recovery_registry.VercelSandboxEnvironment.recover_background_session",
+                return_value=(recovered_env, recovered_adapter),
+            ) as recover_mock:
+            recovered = registry.recover_from_checkpoint()
+
+        assert recovered == 1
+        recover_mock.assert_called_once()
+        session = registry.get("proc_native")
+        assert session is not None
+        assert session.background_adapter is recovered_adapter
+        assert session.env_ref is recovered_env
+        assert len(registry.pending_watchers) == 1
+
+    def test_recover_native_background_process_falls_back_to_pid_recovery(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_native_fallback",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "task_id": "task-1",
+            "background_checkpoint": {
+                "backend": "unsupported_backend",
+            },
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+            patch("tools.process_registry.logger") as logger_mock:
+            recovered = registry.recover_from_checkpoint()
+
+        assert recovered == 1
+        session = registry.get("proc_native_fallback")
+        assert session is not None
+        assert session.detached is True
+        assert session.background_adapter is None
+        logger_mock.warning.assert_called_once()
+
+    def test_recover_invalid_native_background_checkpoint_falls_back_to_pid_recovery(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_native_invalid",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "task_id": "task-1",
+            "background_checkpoint": {
+                "sandbox_id": "sb_missing_backend",
+            },
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+            patch("tools.process_registry.logger") as logger_mock:
+            recovered = registry.recover_from_checkpoint()
+
+        assert recovered == 1
+        session = registry.get("proc_native_invalid")
+        assert session is not None
+        assert session.detached is True
+        assert session.background_adapter is None
+        logger_mock.warning.assert_called_once()
+
+    def test_recover_native_background_process_with_missing_command_falls_back_to_pid_recovery(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_native_missing_command",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "task_id": "task-1",
+            "background_checkpoint": {
+                "backend": "vercel_sandbox",
+                "sandbox_id": "sb_123",
+                "command_id": "cmd_123",
+                "cwd": "/workspace",
+                "timeout": 30,
+                "task_id": "task-1",
+                "persistent_filesystem": True,
+                "resource_constraints": {"cpu": 1, "disk": 51200},
+            },
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+            patch("tools.process_registry.logger") as logger_mock:
+            recovered = registry.recover_from_checkpoint()
+
+        assert recovered == 1
+        session = registry.get("proc_native_missing_command")
+        assert session is not None
+        assert session.detached is True
+        assert session.background_adapter is None
+        logger_mock.warning.assert_called_once()
 
 
 # =========================================================================

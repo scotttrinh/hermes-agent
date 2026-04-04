@@ -52,6 +52,42 @@ class TestParseEnvVar:
         assert result is fake_env
         assert mock_docker.call_args.kwargs["forward_env"] == ["GITHUB_TOKEN"]
 
+    def test_get_env_config_reads_vercel_runtime(self):
+        with patch.dict("os.environ", {
+            "TERMINAL_ENV": "vercel_sandbox",
+            "TERMINAL_VERCEL_RUNTIME": "python3.13",
+        }, clear=False):
+            config = _tt_mod._get_env_config()
+            assert config["vercel_runtime"] == "python3.13"
+
+    def test_create_environment_builds_vercel_backend(self):
+        fake_env = object()
+        with patch.object(_tt_mod, "_VercelSandboxEnvironment", return_value=fake_env) as mock_vercel:
+            result = _tt_mod._create_environment(
+                "vercel_sandbox",
+                image="python3.13",
+                cwd="/workspace",
+                timeout=180,
+                task_id="task-1",
+                container_config={
+                    "container_cpu": 2,
+                    "container_memory": 4096,
+                    "container_disk": 8192,
+                },
+            )
+
+        assert result is fake_env
+        assert mock_vercel.call_args.kwargs == {
+            "runtime": "python3.13",
+            "cwd": "/workspace",
+            "timeout": 180,
+            "cpu": 2,
+            "memory": 4096,
+            "disk": 8192,
+            "persistent_filesystem": True,
+            "task_id": "task-1",
+        }
+
     def test_falls_back_to_default(self):
         with patch.dict("os.environ", {}, clear=False):
             # Remove the var if it exists, rely on default

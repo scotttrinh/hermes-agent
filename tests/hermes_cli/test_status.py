@@ -42,3 +42,18 @@ def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys,
     assert "Manager:      Termux / manual process" in output
     assert "Start with:   hermes gateway" in output
     assert "systemd (user)" not in output
+
+def test_show_status_reports_vercel_backend(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
+    monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
+    monkeypatch.setenv("VERCEL_OIDC_TOKEN", "oidc-token")
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "vercel_sandbox" in output
+    assert "python3.13" in output
+    assert "configured (OIDC)" in output
+    assert "snapshot-backed file restore" in output
+    assert "live sandbox/process continuity is not guaranteed" in output

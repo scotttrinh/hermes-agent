@@ -14,6 +14,10 @@ def _clear_terminal_env(monkeypatch):
         "TERMINAL_SSH_USER",
         "MODAL_TOKEN_ID",
         "MODAL_TOKEN_SECRET",
+        "VERCEL_OIDC_TOKEN",
+        "VERCEL_PROJECT_ID",
+        "VERCEL_TEAM_ID",
+        "VERCEL_TOKEN",
         "HOME",
         "USERPROFILE",
     ]
@@ -168,3 +172,44 @@ def test_modal_backend_managed_mode_without_feature_flag_logs_clear_error(monkey
         "HERMES_ENABLE_NOUS_MANAGED_TOOLS is not enabled" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_vercel_sandbox_backend_without_sdk_logs_clear_error(monkeypatch, caplog):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
+    monkeypatch.setattr(terminal_tool_module.importlib.util, "find_spec", lambda _name: None)
+
+    with caplog.at_level(logging.ERROR):
+        ok = terminal_tool_module.check_terminal_requirements()
+
+    assert ok is False
+    assert any(
+        "vercel is required for the Vercel Sandbox terminal backend" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_vercel_sandbox_backend_without_credentials_logs_clear_error(monkeypatch, caplog):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
+    monkeypatch.setattr(terminal_tool_module.importlib.util, "find_spec", lambda _name: object())
+
+    with caplog.at_level(logging.ERROR):
+        ok = terminal_tool_module.check_terminal_requirements()
+
+    assert ok is False
+    assert any(
+        "Vercel Sandbox backend selected but credentials are missing" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_vercel_sandbox_backend_with_token_credentials_passes(monkeypatch):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
+    monkeypatch.setenv("VERCEL_TOKEN", "tok")
+    monkeypatch.setenv("VERCEL_PROJECT_ID", "prj")
+    monkeypatch.setenv("VERCEL_TEAM_ID", "team")
+    monkeypatch.setattr(terminal_tool_module.importlib.util, "find_spec", lambda _name: object())
+
+    assert terminal_tool_module.check_terminal_requirements() is True

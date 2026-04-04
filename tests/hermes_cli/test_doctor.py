@@ -344,7 +344,6 @@ def test_run_doctor_kimi_cn_env_is_detected_and_probe_is_null_safe(monkeypatch, 
     assert "str expected, not NoneType" not in out
     assert any(url == "https://api.moonshot.cn/v1/models" for url, _, _ in calls)
 
-
 @pytest.mark.parametrize("base_url", [None, "https://opencode.ai/zen/go/v1"])
 def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path, base_url):
     home = tmp_path / ".hermes"
@@ -397,3 +396,38 @@ def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path
     )
     assert not any(url == "https://opencode.ai/zen/go/v1/models" for url, _, _ in calls)
     assert not any("opencode" in url.lower() and "models" in url.lower() for url, _, _ in calls)
+
+def test_run_doctor_reports_vercel_backend_guidance(monkeypatch, tmp_path, capsys):
+    project_root = tmp_path / "project"
+    hermes_home = tmp_path / ".hermes"
+    project_root.mkdir()
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text("")
+    (hermes_home / "config.yaml").write_text("terminal:\n  backend: vercel_sandbox\n  vercel_runtime: python3.13\n")
+
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(doctor_mod, "_DHH", "~/.hermes")
+    monkeypatch.setattr(doctor_mod, "load_config", lambda: {"terminal": {"backend": "vercel_sandbox", "vercel_runtime": "python3.13"}})
+    monkeypatch.setattr(doctor_mod.shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(doctor_mod.importlib.util, "find_spec", lambda name: None if name == "vercel" else object())
+    monkeypatch.setattr(doctor_mod, "_check_gateway_service_linger", lambda issues: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "model_tools",
+        types.SimpleNamespace(check_tool_availability=lambda: ([], []), TOOLSET_REQUIREMENTS={}),
+    )
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("VERCEL_OIDC_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
+    monkeypatch.delenv("VERCEL_TEAM_ID", raising=False)
+
+    doctor_mod.run_doctor(Namespace(fix=False))
+
+    output = capsys.readouterr().out
+    assert "Vercel runtime: python3.13" in output
+    assert "Persistence is snapshot-backed file restore; live sandbox/process continuity is not guaranteed" in output
+    assert "vercel SDK not installed" in output
+    assert "install hermes-agent[vercel]" in output
+    assert "Vercel Sandbox credentials not configured" in output

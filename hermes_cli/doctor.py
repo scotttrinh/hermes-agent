@@ -9,8 +9,9 @@ import sys
 import subprocess
 import shutil
 from pathlib import Path
+import importlib.util
 
-from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_cli.config import get_project_root, get_hermes_home, get_env_path, load_config
 from hermes_constants import display_hermes_home
 
 PROJECT_ROOT = get_project_root()
@@ -615,7 +616,11 @@ def run_doctor(args):
         check_info(f"Install for faster search: {_system_package_install_cmd('ripgrep')}")
     
     # Docker (optional)
-    terminal_env = os.getenv("TERMINAL_ENV", "local")
+    try:
+        terminal_cfg = load_config().get("terminal", {})
+    except Exception:
+        terminal_cfg = {}
+    terminal_env = os.getenv("TERMINAL_ENV") or terminal_cfg.get("backend", "local")
     if terminal_env == "docker":
         if shutil.which("docker"):
             # Check if docker daemon is running
@@ -677,6 +682,34 @@ def run_doctor(args):
         except ImportError:
             check_fail("daytona SDK not installed", "(pip install daytona)")
             issues.append("Install daytona SDK: pip install daytona")
+
+    if terminal_env == "vercel_sandbox":
+        vercel_runtime = os.getenv("TERMINAL_VERCEL_RUNTIME") or str(terminal_cfg.get("vercel_runtime", "node22"))
+        check_info(f"Vercel runtime: {vercel_runtime}")
+        check_info("Persistence is snapshot-backed file restore; live sandbox/process continuity is not guaranteed")
+
+        if importlib.util.find_spec("vercel") is not None:
+            check_ok("vercel SDK", "(installed)")
+        else:
+            check_fail("vercel SDK not installed", "(install hermes-agent[vercel])")
+            issues.append("Install Hermes with Vercel support: pip install 'hermes-agent[vercel]'")
+
+        if os.getenv("VERCEL_OIDC_TOKEN"):
+            check_ok("VERCEL_OIDC_TOKEN", "(configured)")
+        else:
+            token = os.getenv("VERCEL_TOKEN")
+            project = os.getenv("VERCEL_PROJECT_ID")
+            team = os.getenv("VERCEL_TEAM_ID")
+            if token and project and team:
+                check_ok("VERCEL_TOKEN / PROJECT_ID / TEAM_ID", "(configured)")
+            else:
+                check_fail(
+                    "Vercel Sandbox credentials not configured",
+                    "(set VERCEL_OIDC_TOKEN or VERCEL_TOKEN + VERCEL_PROJECT_ID + VERCEL_TEAM_ID)",
+                )
+                issues.append(
+                    "Configure Vercel Sandbox credentials in ~/.hermes/.env or run 'hermes setup terminal'"
+                )
 
     # Node.js + agent-browser (for browser automation tools)
     if shutil.which("node"):

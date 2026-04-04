@@ -2,7 +2,7 @@
 """
 Terminal Tool Module
 
-A terminal tool that executes commands in local, Docker, Modal, SSH, Singularity, and Daytona environments.
+A terminal tool that executes commands in local, Docker, Modal, SSH, Singularity, Daytona, and Vercel Sandbox environments.
 Supports local execution, containerized backends, and Modal cloud sandboxes, including managed gateway mode.
 
 Environment Selection (via TERMINAL_ENV environment variable):
@@ -506,6 +506,7 @@ from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
+from tools.environments.vercel_sandbox import VercelSandboxEnvironment as _VercelSandboxEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 
 
@@ -610,6 +611,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = os.getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "vercel_sandbox":
+        default_cwd = "/"
     else:
         default_cwd = "/root"
 
@@ -629,7 +632,7 @@ def _get_env_config() -> Dict[str, Any]:
         ):
             host_cwd = candidate
             cwd = "/workspace"
-    elif env_type in ("modal", "docker", "singularity", "daytona") and cwd:
+    elif env_type in ("modal", "docker", "singularity", "daytona", "vercel_sandbox") and cwd:
         # Host paths and relative paths that won't work inside containers
         is_host_path = any(cwd.startswith(p) for p in host_prefixes)
         is_relative = not os.path.isabs(cwd)  # e.g. "." or "src/"
@@ -647,6 +650,7 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "node22"),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -692,8 +696,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     Create an execution environment for sandboxed command execution.
     
     Args:
-        env_type: One of "local", "docker", "singularity", "modal", "daytona", "ssh"
-        image: Docker/Singularity/Modal image name (ignored for local/ssh)
+        env_type: One of "local", "docker", "singularity", "modal", "daytona", "vercel_sandbox", "ssh"
+        image: Docker/Singularity/Modal image name or Vercel runtime
         cwd: Working directory
         timeout: Default command timeout
         ssh_config: SSH connection config (for env_type="ssh")
@@ -796,6 +800,18 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
+    elif env_type == "vercel_sandbox":
+        return _VercelSandboxEnvironment(
+            runtime=image,
+            cwd=cwd,
+            timeout=timeout,
+            cpu=cpu,
+            memory=memory,
+            disk=disk,
+            persistent_filesystem=persistent,
+            task_id=task_id,
+        )
+
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -809,7 +825,20 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
 
     else:
-        raise ValueError(f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', 'modal', 'daytona', or 'ssh'")
+        raise ValueError(
+            f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', "
+            "'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+        )
+
+
+def _has_vercel_credentials() -> bool:
+    """Return True when the Vercel Sandbox SDK can resolve credentials."""
+    if os.getenv("VERCEL_OIDC_TOKEN"):
+        return True
+    return all(
+        os.getenv(name)
+        for name in ("VERCEL_TOKEN", "VERCEL_PROJECT_ID", "VERCEL_TEAM_ID")
+    )
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
@@ -1110,6 +1139,7 @@ def terminal_tool(
     task_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
+    check_interval: Optional[int] = None,
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
@@ -1124,6 +1154,7 @@ def terminal_tool(
         task_id: Unique identifier for environment isolation (optional)
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
+        check_interval: Seconds between auto-checks for background processes (gateway only, min 30)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, auto-notify the agent when the process exits
         watch_patterns: List of strings to watch for in background output; triggers notification on match
@@ -1177,6 +1208,8 @@ def terminal_tool(
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
+        elif env_type == "vercel_sandbox":
+            image = overrides.get("vercel_runtime") or config["vercel_runtime"]
         else:
             image = ""
 
@@ -1241,7 +1274,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in ("docker", "singularity", "modal", "daytona"):
+                        if env_type in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -1388,7 +1421,7 @@ def terminal_tool(
                 # Populate routing metadata on the session so that
                 # watch-pattern and completion notifications can be
                 # routed back to the correct chat/thread.
-                if background and (notify_on_complete or watch_patterns):
+                if background and (notify_on_complete or watch_patterns or check_interval):
                     from gateway.session_context import get_session_env as _gse
                     _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
                     if _gw_platform:
@@ -1428,6 +1461,37 @@ def terminal_tool(
                 if watch_patterns and background:
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
+
+                # Register check_interval watcher (gateway picks this up after agent run)
+                if check_interval and background:
+                    effective_interval = max(30, check_interval)
+                    if check_interval < 30:
+                        result_data["check_interval_note"] = (
+                            f"Requested {check_interval}s raised to minimum 30s"
+                        )
+                    watcher_platform = proc_session.watcher_platform
+                    watcher_chat_id = proc_session.watcher_chat_id
+                    watcher_thread_id = proc_session.watcher_thread_id
+
+                    # Store on session for checkpoint persistence in case the
+                    # platform metadata was populated via plain env vars only.
+                    proc_session.watcher_platform = watcher_platform
+                    proc_session.watcher_chat_id = watcher_chat_id
+                    proc_session.watcher_thread_id = watcher_thread_id
+                    proc_session.watcher_interval = effective_interval
+                    process_registry.ensure_background_monitor(proc_session.id)
+
+                    process_registry.pending_watchers.append({
+                        "session_id": proc_session.id,
+                        "check_interval": effective_interval,
+                        "session_key": session_key,
+                        "platform": watcher_platform,
+                        "chat_id": watcher_chat_id,
+                        "user_id": proc_session.watcher_user_id,
+                        "user_name": proc_session.watcher_user_name,
+                        "thread_id": watcher_thread_id,
+                        "notify_on_complete": proc_session.notify_on_complete,
+                    })
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
@@ -1627,10 +1691,24 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
+        elif env_type == "vercel_sandbox":
+            if importlib.util.find_spec("vercel") is None:
+                logger.error(
+                    "vercel is required for the Vercel Sandbox terminal backend: pip install vercel"
+                )
+                return False
+            if not _has_vercel_credentials():
+                logger.error(
+                    "Vercel Sandbox backend selected but credentials are missing. "
+                    "Set VERCEL_OIDC_TOKEN, or set VERCEL_TOKEN, VERCEL_PROJECT_ID, and VERCEL_TEAM_ID."
+                )
+                return False
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, vercel_sandbox, ssh.",
                 env_type,
             )
             return False
@@ -1670,11 +1748,12 @@ if __name__ == "__main__":
 
     print("\nEnvironment Variables:")
     default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
-    print(f"  TERMINAL_ENV: {os.getenv('TERMINAL_ENV', 'local')} (local/docker/singularity/modal/daytona/ssh)")
+    print(f"  TERMINAL_ENV: {os.getenv('TERMINAL_ENV', 'local')} (local/docker/singularity/modal/daytona/vercel_sandbox/ssh)")
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
     print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
     print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
+    print(f"  TERMINAL_VERCEL_RUNTIME: {os.getenv('TERMINAL_VERCEL_RUNTIME', 'node22')}")
     print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', os.getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
@@ -1711,6 +1790,11 @@ TERMINAL_SCHEMA = {
                 "type": "string",
                 "description": "Working directory for this command (absolute path). Defaults to the session working directory."
             },
+            "check_interval": {
+                "type": "integer",
+                "description": "Seconds between automatic status checks for background processes (gateway/messaging only, minimum 30). When set, Hermes proactively reports progress.",
+                "minimum": 30
+            },
             "pty": {
                 "type": "boolean",
                 "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
@@ -1739,6 +1823,7 @@ def _handle_terminal(args, **kw):
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         workdir=args.get("workdir"),
+        check_interval=args.get("check_interval"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),

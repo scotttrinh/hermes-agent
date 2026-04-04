@@ -259,15 +259,13 @@ def show_status(args):
     print()
     print(color("◆ Terminal Backend", Colors.CYAN, Colors.BOLD))
     
-    terminal_env = os.getenv("TERMINAL_ENV", "")
-    if not terminal_env:
-        # Fall back to config file value when env var isn't set
-        # (hermes status doesn't go through cli.py's config loading)
-        try:
-            _cfg = load_config()
-            terminal_env = _cfg.get("terminal", {}).get("backend", "local")
-        except Exception:
-            terminal_env = "local"
+    try:
+        _cfg = load_config()
+        terminal_cfg = _cfg.get("terminal", {})
+    except Exception:
+        terminal_cfg = {}
+
+    terminal_env = os.getenv("TERMINAL_ENV", "") or terminal_cfg.get("backend", "local")
     print(f"  Backend:      {terminal_env}")
     
     if terminal_env == "ssh":
@@ -281,6 +279,21 @@ def show_status(args):
     elif terminal_env == "daytona":
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
+    elif terminal_env == "vercel_sandbox":
+        vercel_runtime = os.getenv("TERMINAL_VERCEL_RUNTIME", str(terminal_cfg.get("vercel_runtime", "node22")))
+        vercel_oidc = os.getenv("VERCEL_OIDC_TOKEN", "")
+        vercel_token = os.getenv("VERCEL_TOKEN", "")
+        vercel_project = os.getenv("VERCEL_PROJECT_ID", "")
+        vercel_team = os.getenv("VERCEL_TEAM_ID", "")
+        if vercel_oidc:
+            credentials_status = "configured (OIDC)"
+        elif vercel_token and vercel_project and vercel_team:
+            credentials_status = "configured (API token + project/team)"
+        else:
+            credentials_status = "not configured"
+        print(f"  Vercel Runtime: {vercel_runtime}")
+        print(f"  Credentials:    {check_mark(credentials_status.startswith('configured'))} {credentials_status}")
+        print("  Persistence:    snapshot-backed file restore; live sandbox/process continuity is not guaranteed")
     
     sudo_password = os.getenv("SUDO_PASSWORD", "")
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")

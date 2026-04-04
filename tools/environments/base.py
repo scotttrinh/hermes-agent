@@ -6,6 +6,8 @@ re-sourced before each command. CWD persists via in-band stdout markers (remote)
 or a temp file (local).
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -16,9 +18,14 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import IO, Callable, Protocol
+from typing import IO, Any, Callable, Protocol
 
 from hermes_constants import get_hermes_home
+from tools.environments.background_contracts import (
+    BackgroundProcessAdapter,
+    BackendBackgroundCheckpoint,
+)
+from tools.environments.shell_background import ShellEnvironmentBackgroundAdapter
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -585,6 +592,38 @@ class BaseEnvironment(ABC):
         """Alias for cleanup (compat with older callers)."""
         self.cleanup()
 
+    def create_background_process_adapter(
+        self,
+        *,
+        command: str,
+        session_id: str,
+        cwd: str | None,
+    ) -> BackgroundProcessAdapter:
+        """Build the detached-process adapter for this environment backend."""
+
+        return ShellEnvironmentBackgroundAdapter(
+            env=self,
+            command=command,
+            session_id=session_id,
+        )
+
+    @classmethod
+    def parse_background_checkpoint(cls, payload: Any) -> BackendBackgroundCheckpoint:
+        """Parse backend-owned checkpoint JSON into a structured model."""
+        raise ValueError(
+            f"Background-process checkpoint parsing is not supported for backend {cls.__name__}"
+        )
+
+    @classmethod
+    def recover_background_session(
+        cls,
+        checkpoint: BackendBackgroundCheckpoint,
+    ) -> tuple[BaseEnvironment, BackgroundProcessAdapter]:
+        """Recover a background-process environment/adapter pair from checkpoint metadata."""
+        raise ValueError(
+            f"Background-process recovery is not supported for backend {cls.__name__}"
+        )
+
     def __del__(self):
         try:
             self.cleanup()
@@ -597,3 +636,10 @@ class BaseEnvironment(ABC):
 
         return _transform_sudo_command(command)
 
+    def _timeout_result(self, timeout: int | None) -> dict[str, Any]:
+        """Standard return dict when a command times out."""
+        effective_timeout = timeout or self.timeout
+        return {
+            "output": f"Command timed out after {effective_timeout}s",
+            "returncode": 124,
+        }

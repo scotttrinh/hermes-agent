@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+import threading
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
@@ -293,4 +294,50 @@ class TestSearchHints:
         assert "offset=100" in raw
 
 
+class TestEnvironmentSelection:
+    def test_get_file_ops_builds_vercel_backend_with_runtime_and_persistence(self):
+        import tools.file_tools as file_tools_mod
+        import tools.terminal_tool as terminal_tool_mod
+
+        fake_env = object()
+        fake_ops = object()
+        task_id = "vercel-file-tools"
+
+        file_tools_mod.clear_file_ops_cache(task_id)
+
+        with patch.object(terminal_tool_mod, "_active_environments", {}), \
+             patch.object(terminal_tool_mod, "_last_activity", {}), \
+             patch.object(terminal_tool_mod, "_creation_locks", {}), \
+             patch.object(terminal_tool_mod, "_env_lock", threading.Lock()), \
+             patch.object(terminal_tool_mod, "_creation_locks_lock", threading.Lock()), \
+             patch.object(terminal_tool_mod, "_task_env_overrides", {}), \
+             patch.object(terminal_tool_mod, "_get_env_config", return_value={
+                 "env_type": "vercel_sandbox",
+                 "vercel_runtime": "python3.13",
+                 "cwd": "/workspace",
+                 "timeout": 180,
+                 "host_cwd": None,
+                 "container_cpu": 2,
+                 "container_memory": 4096,
+                 "container_disk": 8192,
+                 "container_persistent": True,
+                 "docker_volumes": [],
+             }), \
+             patch.object(terminal_tool_mod, "_create_environment", return_value=fake_env) as mock_create, \
+             patch.object(terminal_tool_mod, "_start_cleanup_thread", return_value=None), \
+             patch.object(file_tools_mod, "ShellFileOperations", return_value=fake_ops):
+            result = file_tools_mod._get_file_ops(task_id)
+
+        assert result is fake_ops
+        assert mock_create.call_args.kwargs["env_type"] == "vercel_sandbox"
+        assert mock_create.call_args.kwargs["image"] == "python3.13"
+        assert mock_create.call_args.kwargs["container_config"] == {
+            "container_cpu": 2,
+            "container_memory": 4096,
+            "container_disk": 8192,
+            "container_persistent": True,
+            "docker_volumes": [],
+        }
+
+        file_tools_mod.clear_file_ops_cache(task_id)
 
