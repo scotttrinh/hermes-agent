@@ -8,6 +8,7 @@ import yaml
 
 from hermes_cli.config import (
     DEFAULT_CONFIG,
+    _format_vercel_credentials_status,
     get_hermes_home,
     ensure_hermes_home,
     get_compatible_custom_providers,
@@ -70,6 +71,40 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+
+
+class TestVercelConfigDisplay:
+    def test_format_vercel_credentials_status_with_oidc(self):
+        assert _format_vercel_credentials_status(
+            vercel_oidc="oidc",
+            vercel_token="",
+            vercel_project="",
+            vercel_team="",
+        ) == "OIDC token configured"
+
+    def test_format_vercel_credentials_status_with_complete_api_token_mode(self):
+        assert _format_vercel_credentials_status(
+            vercel_oidc="",
+            vercel_token="token",
+            vercel_project="project",
+            vercel_team="team",
+        ) == "API token + project/team configured"
+
+    def test_format_vercel_credentials_status_with_partial_api_token_mode(self):
+        assert _format_vercel_credentials_status(
+            vercel_oidc="",
+            vercel_token="token",
+            vercel_project="",
+            vercel_team="team",
+        ) == "partial API token config; missing VERCEL_PROJECT_ID"
+
+    def test_format_vercel_credentials_status_with_no_credentials(self):
+        assert _format_vercel_credentials_status(
+            vercel_oidc="",
+            vercel_token="",
+            vercel_project="",
+            vercel_team="",
+        ) == "(not set)"
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

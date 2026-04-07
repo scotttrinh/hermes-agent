@@ -3214,6 +3214,31 @@ def redact_key(key: str) -> str:
     return key[:4] + "..." + key[-4:]
 
 
+def _format_vercel_credentials_status(
+    *,
+    vercel_oidc: str,
+    vercel_token: str,
+    vercel_project: str,
+    vercel_team: str,
+) -> str:
+    """Describe the configured Vercel credential mode and any missing fields."""
+    if vercel_oidc:
+        return "OIDC token configured"
+    if vercel_token and vercel_project and vercel_team:
+        return "API token + project/team configured"
+
+    missing = []
+    if not vercel_token:
+        missing.append("VERCEL_TOKEN")
+    if not vercel_project:
+        missing.append("VERCEL_PROJECT_ID")
+    if not vercel_team:
+        missing.append("VERCEL_TEAM_ID")
+    if len(missing) < 3:
+        return f"partial API token config; missing {', '.join(missing)}"
+    return "(not set)"
+
+
 def show_config():
     """Display current configuration."""
     config = load_config()
@@ -3295,12 +3320,12 @@ def show_config():
         vercel_token = get_env_value('VERCEL_TOKEN')
         vercel_project = get_env_value('VERCEL_PROJECT_ID')
         vercel_team = get_env_value('VERCEL_TEAM_ID')
-        if vercel_oidc:
-            cred_status = 'OIDC token configured'
-        elif vercel_token and vercel_project and vercel_team:
-            cred_status = 'API token + project/team configured'
-        else:
-            cred_status = '(not set)'
+        cred_status = _format_vercel_credentials_status(
+            vercel_oidc=vercel_oidc,
+            vercel_token=vercel_token,
+            vercel_project=vercel_project,
+            vercel_team=vercel_team,
+        )
         print(f"  Credentials:  {cred_status}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
