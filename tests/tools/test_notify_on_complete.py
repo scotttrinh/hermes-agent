@@ -13,7 +13,6 @@ import os
 import queue
 import time
 import pytest
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.process_registry import (
@@ -279,7 +278,6 @@ class TestTerminalSchema:
             )
             _, kwargs = mock_tt.call_args
             assert kwargs["notify_on_complete"] is True
-
 
 # =========================================================================
 # Code execution blocked params

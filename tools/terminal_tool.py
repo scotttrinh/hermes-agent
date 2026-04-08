@@ -1445,6 +1445,7 @@ def terminal_tool(
                     # turn.  CLI mode uses the completion_queue directly.
                     if proc_session.watcher_platform:
                         proc_session.watcher_interval = 5
+                        process_registry.ensure_background_monitor(proc_session.id)
                         process_registry.pending_watchers.append({
                             "session_id": proc_session.id,
                             "check_interval": 5,

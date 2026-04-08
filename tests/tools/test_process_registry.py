@@ -554,6 +554,7 @@ class TestNativeBackgroundProcesses:
         with patch("threading.Thread", side_effect=_make_thread), \
             patch.object(registry, "_write_checkpoint"):
             session = registry.spawn_via_env(env, "pytest -q", cwd="/workspace", task_id="task-1")
+            session.notify_on_complete = True
             started = registry.ensure_background_monitor(session.id)
 
         assert started is True
@@ -563,6 +564,9 @@ class TestNativeBackgroundProcesses:
         assert "done" in session.output_buffer
         assert session.id in registry._finished
         assert env.poll_background_process.call_count == 2
+        completion = registry.completion_queue.get_nowait()
+        assert completion["session_id"] == session.id
+        assert completion["exit_code"] == 0
 
 
 class TestShellBackgroundAdapterResults:
@@ -811,6 +815,31 @@ class TestCheckpoint:
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
             assert registry.get("proc_remote") is None
+
+            data = json.loads(checkpoint.read_text())
+            assert data == []
+
+    def test_recovery_skips_shell_fallback_non_local_entries_with_sandbox_scope(
+        self, registry, tmp_path
+    ):
+        checkpoint = tmp_path / "procs.json"
+        original = [{
+            "session_id": "proc_shell_remote",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "task_id": "t1",
+            "pid_scope": "sandbox",
+            "background_checkpoint": {
+                "backend": "shell",
+                "pid": os.getpid(),
+            },
+        }]
+        checkpoint.write_text(json.dumps(original))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            recovered = registry.recover_from_checkpoint()
+            assert recovered == 0
+            assert registry.get("proc_shell_remote") is None
 
             data = json.loads(checkpoint.read_text())
             assert data == []
