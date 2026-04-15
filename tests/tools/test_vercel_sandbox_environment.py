@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 import types
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -151,6 +152,18 @@ class _FakeSDK:
         return box
 
 
+@dataclass(frozen=True)
+class _FakeResources:
+    vcpus: int | None = None
+    memory: int | None = None
+
+
+@dataclass(frozen=True)
+class _FakeSnapshotSource:
+    snapshot_id: str
+    type: str = field(default="snapshot", init=False)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -173,6 +186,8 @@ def vercel_sdk(monkeypatch):
     sandbox_mod.SandboxPermissionError = type("SandboxPermissionError", (Exception,), {})
     sandbox_mod.SandboxRateLimitError = type("SandboxRateLimitError", (Exception,), {})
     sandbox_mod.SandboxServerError = type("SandboxServerError", (Exception,), {})
+    sandbox_mod.Resources = _FakeResources
+    sandbox_mod.SnapshotSource = _FakeSnapshotSource
     vercel_mod = types.ModuleType("vercel")
     vercel_mod.sandbox = sandbox_mod
     monkeypatch.setitem(sys.modules, "vercel", vercel_mod)
@@ -225,69 +240,59 @@ class TestConstructor:
 
         make_env(task_id="task-restore", persistent_filesystem=True)
 
-        assert vercel_sdk.create_kwargs[0]["source"] == {
-            "type": "snapshot",
-            "snapshot_id": "snap_saved",
-        }
+        source = vercel_sdk.create_kwargs[0]["source"]
+        assert isinstance(source, _FakeSnapshotSource)
+        assert source.snapshot_id == "snap_saved"
 
     def test_maps_resources_to_vercel_shape(self, vercel_sdk, make_env):
         make_env(task_id="task-resources", cpu=2, memory=4096)
 
-        assert vercel_sdk.create_kwargs[0]["resources"] == {
-            "vcpus": 2,
-            "memory": 4096,
-        }
+        resources = vercel_sdk.create_kwargs[0]["resources"]
+        assert isinstance(resources, _FakeResources)
+        assert resources == _FakeResources(vcpus=2, memory=4096)
 
-    def test_warns_and_ignores_explicit_memory_input(self, vercel_sdk, make_env, caplog):
+    def test_forwards_explicit_memory_input_to_sdk_resources(self, vercel_sdk, make_env):
         make_env(task_id="task-memory-ignored", cpu=2, memory=6144)
 
-        assert vercel_sdk.create_kwargs[0]["resources"] == {
-            "vcpus": 2,
-            "memory": 4096,
-        }
-        assert "ignores requested memory=6144 MB" in caplog.text
+        resources = vercel_sdk.create_kwargs[0]["resources"]
+        assert isinstance(resources, _FakeResources)
+        assert resources == _FakeResources(vcpus=2, memory=6144)
 
-    def test_defaults_memory_to_2048_per_vcpu(self, vercel_sdk, make_env):
+    def test_uses_constructor_defaults_for_resources(self, vercel_sdk, make_env):
         make_env(task_id="task-default-memory")
 
-        assert vercel_sdk.create_kwargs[0]["resources"] == {
-            "vcpus": 1,
-            "memory": 2048,
-        }
+        resources = vercel_sdk.create_kwargs[0]["resources"]
+        assert isinstance(resources, _FakeResources)
+        assert resources == _FakeResources(vcpus=1, memory=2048)
 
-    def test_normalizes_shared_generic_memory_default(self, vercel_sdk, make_env):
+    def test_preserves_shared_generic_memory_default_input(self, vercel_sdk, make_env):
         make_env(task_id="task-normalized-memory", cpu=2, memory=5120)
 
-        assert vercel_sdk.create_kwargs[0]["resources"] == {
-            "vcpus": 2,
-            "memory": 4096,
-        }
+        resources = vercel_sdk.create_kwargs[0]["resources"]
+        assert isinstance(resources, _FakeResources)
+        assert resources == _FakeResources(vcpus=2, memory=5120)
 
     def test_treats_shared_default_disk_as_unset(self, vercel_sdk, make_env):
         make_env(task_id="task-default-disk", disk=51200)
 
-        assert vercel_sdk.create_kwargs[0]["resources"] == {
-            "vcpus": 1,
-            "memory": 2048,
-        }
+        resources = vercel_sdk.create_kwargs[0]["resources"]
+        assert isinstance(resources, _FakeResources)
+        assert resources == _FakeResources(vcpus=1, memory=2048)
 
     def test_caps_non_default_disk_request_to_shared_default(self, make_env, vercel_sdk, caplog):
         make_env(task_id="task-disk-request", disk=8192)
 
-        assert vercel_sdk.create_kwargs[0]["resources"] == {
-            "vcpus": 1,
-            "memory": 2048,
-        }
+        resources = vercel_sdk.create_kwargs[0]["resources"]
+        assert isinstance(resources, _FakeResources)
+        assert resources == _FakeResources(vcpus=1, memory=2048)
         assert "does not support configurable container_disk=8192" in caplog.text
 
-    def test_normalizes_fractional_vcpu_to_default_with_warning(self, make_env, vercel_sdk, caplog):
+    def test_forwards_fractional_vcpu_input_to_sdk_resources(self, make_env, vercel_sdk):
         make_env(task_id="task-fractional-cpu", cpu=1.5)
 
-        assert vercel_sdk.create_kwargs[0]["resources"] == {
-            "vcpus": 1,
-            "memory": 2048,
-        }
-        assert "is not a whole number; using default 1 vCPU" in caplog.text
+        resources = vercel_sdk.create_kwargs[0]["resources"]
+        assert isinstance(resources, _FakeResources)
+        assert resources == _FakeResources(vcpus=1.5, memory=2048)
 
     def test_waits_for_running_status(self, vercel_sdk, make_env, monkeypatch):
         pending = _FakeSandbox(status="pending")
@@ -494,7 +499,7 @@ class TestBackgroundProcesses:
             "timeout": 30,
             "task_id": "task-123",
             "persistent_filesystem": True,
-            "resource_constraints": {"cpu": 1, "disk": 51200},
+            "resources": {"vcpus": 1, "memory": 2048},
         }
 
     def test_create_background_process_adapter_returns_vercel_direct_adapter(self, env):
@@ -541,7 +546,7 @@ class TestBackgroundProcesses:
                     "timeout": 45,
                     "task_id": "task-restore",
                     "persistent_filesystem": True,
-                    "resource_constraints": {"cpu": 1, "disk": 51200},
+                    "resources": {"vcpus": 1, "memory": 2048},
                 }
             )
         )
@@ -577,7 +582,7 @@ class TestBackgroundProcesses:
                     "timeout": 45,
                     "task_id": "task-restore",
                     "persistent_filesystem": True,
-                    "resource_constraints": {"cpu": 1, "disk": 51200},
+                    "resources": {"vcpus": 1, "memory": 2048},
                 }
             )
         )
@@ -587,7 +592,7 @@ class TestBackgroundProcesses:
         assert adapter.env is env
         assert adapter.handle.command_id == "cmd_recovered"
 
-    def test_recover_background_handle_uses_structured_resource_constraints(
+    def test_recover_background_handle_restores_direct_resources(
         self, vercel_sdk, vercel_module, monkeypatch
     ):
         recovered_sandbox = _FakeSandbox(cwd="/workspace")
@@ -613,13 +618,15 @@ class TestBackgroundProcesses:
                     "timeout": 45,
                     "task_id": "task-restore",
                     "persistent_filesystem": True,
-                    "resource_constraints": {"cpu": 2, "disk": 51200},
+                    "resources": {"vcpus": 2, "memory": 4096},
                 }
             )
         )
 
-        assert env._resource_constraints.to_checkpoint() == {"cpu": 2, "disk": 51200}
-        assert env._resource_constraints.to_vercel_resources() == {"vcpus": 2, "memory": 4096}
+        assert env._resources == _FakeResources(
+            vcpus=2,
+            memory=4096,
+        )
         assert handle.command_id == "cmd_legacy"
 
     def test_checkpoint_parse_rejects_missing_command(self, vercel_module):
@@ -634,7 +641,7 @@ class TestBackgroundProcesses:
                     "timeout": 45,
                     "task_id": "task-restore",
                     "persistent_filesystem": True,
-                    "resource_constraints": {"cpu": 2, "disk": 51200},
+                    "resources": {"vcpus": 2, "memory": 4096},
                 }
             )
 

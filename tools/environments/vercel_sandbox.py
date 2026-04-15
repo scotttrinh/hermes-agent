@@ -15,7 +15,7 @@ import shlex
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ from tools.environments.background_contracts import (
 )
 from tools.environments.base import BaseEnvironment
 from tools.interrupt import is_interrupted
+from vercel.sandbox import Resources, SnapshotSource
 
 logger = logging.getLogger(__name__)
 
@@ -82,111 +83,30 @@ def _delete_snapshot(task_id: str, snapshot_id: str | None = None) -> None:
         _save_snapshots(snapshots)
 
 
-@dataclass(frozen=True)
-class VercelResourceConstraints:
-    """Typed Vercel resource contract persisted across checkpoint recovery."""
+def _normalize_vercel_container_disk(disk: Any, *, warn: bool) -> int:
+    if disk in (None, 0):
+        return _DEFAULT_SHARED_CONTAINER_DISK_MB
 
-    cpu: int = 1
-    disk: int = _DEFAULT_SHARED_CONTAINER_DISK_MB
-
-    @classmethod
-    def from_inputs(
-        cls,
-        *,
-        cpu: float | int | None,
-        memory: Any = None,
-        disk: Any = None,
-    ) -> VercelResourceConstraints:
-        if cpu in (None, 0):
-            normalized_cpu = 1
-        else:
-            if cpu < 0:
-                logger.warning(
-                    "Vercel Sandbox cpu %s is invalid; using default 1 vCPU",
-                    cpu,
-                )
-                normalized_cpu = 1
-            elif int(cpu) != cpu:
-                logger.warning(
-                    "Vercel Sandbox cpu %s is not a whole number; using default 1 vCPU",
-                    cpu,
-                )
-                normalized_cpu = 1
-            else:
-                normalized_cpu = int(cpu)
-                if normalized_cpu <= 0:
-                    logger.warning(
-                        "Vercel Sandbox cpu %s must be greater than zero; using default 1 vCPU",
-                        cpu,
-                    )
-                    normalized_cpu = 1
-
-        effective_vcpus = normalized_cpu
-
-        if memory not in (None, 0):
+    normalized_disk = int(disk)
+    if normalized_disk <= 0:
+        if warn:
             logger.warning(
-                "Vercel Sandbox ignores requested memory=%s MB; "
-                "Vercel derives memory from cpu=%s and will use %s MB",
-                memory,
-                effective_vcpus,
-                effective_vcpus * _VERCEL_MEMORY_PER_VCPU_MB,
+                "Vercel Sandbox disk %s is invalid; using shared default %s MB",
+                disk,
+                _DEFAULT_SHARED_CONTAINER_DISK_MB,
             )
+        return _DEFAULT_SHARED_CONTAINER_DISK_MB
 
-        if disk in (None, 0):
-            normalized_disk = _DEFAULT_SHARED_CONTAINER_DISK_MB
-        else:
-            normalized_disk = int(disk)
-            if normalized_disk <= 0:
-                logger.warning(
-                    "Vercel Sandbox disk %s is invalid; using shared default %s MB",
-                    disk,
-                    _DEFAULT_SHARED_CONTAINER_DISK_MB,
-                )
-                normalized_disk = _DEFAULT_SHARED_CONTAINER_DISK_MB
-            elif normalized_disk != _DEFAULT_SHARED_CONTAINER_DISK_MB:
-                logger.warning(
-                    "Vercel Sandbox does not support configurable container_disk=%s; using shared default %s MB",
-                    normalized_disk,
-                    _DEFAULT_SHARED_CONTAINER_DISK_MB,
-                )
-                normalized_disk = _DEFAULT_SHARED_CONTAINER_DISK_MB
+    if normalized_disk != _DEFAULT_SHARED_CONTAINER_DISK_MB:
+        if warn:
+            logger.warning(
+                "Vercel Sandbox does not support configurable container_disk=%s; using shared default %s MB",
+                normalized_disk,
+                _DEFAULT_SHARED_CONTAINER_DISK_MB,
+            )
+        return _DEFAULT_SHARED_CONTAINER_DISK_MB
 
-        return cls(
-            cpu=normalized_cpu,
-            disk=normalized_disk,
-        )
-
-    @classmethod
-    def from_checkpoint(
-        cls,
-        checkpoint: dict[str, Any] | None,
-    ) -> VercelResourceConstraints:
-        payload = checkpoint or {}
-        return cls.from_inputs(
-            cpu=payload.get("cpu"),
-            memory=payload.get("memory"),
-            disk=payload.get("disk"),
-        )
-
-    @property
-    def effective_vcpus(self) -> int:
-        return self.cpu
-
-    @property
-    def effective_memory_mb(self) -> int:
-        return self.effective_vcpus * _VERCEL_MEMORY_PER_VCPU_MB
-
-    def to_vercel_resources(self) -> dict[str, int]:
-        return {
-            "vcpus": self.effective_vcpus,
-            "memory": self.effective_memory_mb,
-        }
-
-    def to_checkpoint(self) -> dict[str, int]:
-        return {
-            "cpu": self.cpu,
-            "disk": self.disk,
-        }
+    return normalized_disk
 
 
 @dataclass
@@ -261,7 +181,7 @@ class VercelBackgroundCheckpoint(BackendBackgroundCheckpoint):
     timeout: int
     task_id: str
     persistent_filesystem: bool
-    resource_constraints: VercelResourceConstraints
+    resources: Resources
 
     @classmethod
     def from_json(cls, payload: Any) -> VercelBackgroundCheckpoint:
@@ -300,11 +220,10 @@ class VercelBackgroundCheckpoint(BackendBackgroundCheckpoint):
         runtime = payload.get("runtime")
         if runtime is not None and not isinstance(runtime, str):
             raise ValueError("Vercel background checkpoint runtime must be a string or null")
-        resource_constraints = payload.get("resource_constraints")
-        if not isinstance(resource_constraints, dict):
-            raise ValueError(
-                "Vercel background checkpoint is missing resource_constraints"
-            )
+        resources_payload = payload.get("resources")
+        if not isinstance(resources_payload, dict):
+            raise ValueError("Vercel background checkpoint is missing resources")
+        resources = Resources(**resources_payload)
 
         return cls(
             backend="vercel_sandbox",
@@ -316,15 +235,25 @@ class VercelBackgroundCheckpoint(BackendBackgroundCheckpoint):
             timeout=timeout,
             task_id=task_id,
             persistent_filesystem=persistent_filesystem,
-            resource_constraints=VercelResourceConstraints.from_checkpoint(
-                resource_constraints
-            ),
+            resources=resources,
         )
 
     def to_json(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["resource_constraints"] = self.resource_constraints.to_checkpoint()
-        return payload
+        return {
+            "backend": self.backend,
+            "command": self.command,
+            "sandbox_id": self.sandbox_id,
+            "command_id": self.command_id,
+            "runtime": self.runtime,
+            "cwd": self.cwd,
+            "timeout": self.timeout,
+            "task_id": self.task_id,
+            "persistent_filesystem": self.persistent_filesystem,
+            "resources": {
+                "vcpus": self.resources.vcpus,
+                "memory": self.resources.memory,
+            },
+        }
 
 
 class VercelSandboxEnvironment(BaseEnvironment):
@@ -385,11 +314,8 @@ class VercelSandboxEnvironment(BaseEnvironment):
         self._requested_cwd = cwd
         self._persistent = persistent_filesystem
         self._task_id = task_id
-        self._resource_constraints = VercelResourceConstraints.from_inputs(
-            cpu=cpu,
-            memory=memory,
-            disk=disk,
-        )
+        self._resources = Resources(vcpus=cpu, memory=memory)
+        _normalize_vercel_container_disk(disk, warn=True)
         self._lock = threading.Lock()
         self._sandbox = None
         self._remote_home = "/root"
@@ -525,7 +451,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
             timeout=self.timeout,
             task_id=self._task_id,
             persistent_filesystem=self._persistent,
-            resource_constraints=self._resource_constraints,
+            resources=self._resources,
         )
 
     @classmethod
@@ -556,7 +482,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         env._requested_cwd = checkpoint.cwd
         env._persistent = checkpoint.persistent_filesystem
         env._task_id = checkpoint.task_id
-        env._resource_constraints = checkpoint.resource_constraints
+        env._resources = checkpoint.resources
         env._lock = threading.Lock()
         env._sandbox = sandbox
         env._remote_home = "/root"
@@ -617,17 +543,15 @@ class VercelSandboxEnvironment(BaseEnvironment):
 
         sandbox_timeout_seconds = max(self.timeout, self._sandbox_timeout_floor_seconds)
         sandbox_timeout_ms = int((sandbox_timeout_seconds + self._sandbox_timeout_grace_seconds) * 1000)
+        resources = self._resources
 
         if restore_snapshot:
             try:
                 sandbox = Sandbox.create(
                     timeout=sandbox_timeout_ms,
                     runtime=self._runtime,
-                    resources=self._resource_constraints.to_vercel_resources(),
-                    source={
-                        "type": "snapshot",
-                        "snapshot_id": restore_snapshot,
-                    },
+                    resources=resources,
+                    source=SnapshotSource(snapshot_id=restore_snapshot),
                 )
             except Exception:
                 logger.warning(
@@ -639,13 +563,13 @@ class VercelSandboxEnvironment(BaseEnvironment):
                 sandbox = Sandbox.create(
                     timeout=sandbox_timeout_ms,
                     runtime=self._runtime,
-                    resources=self._resource_constraints.to_vercel_resources(),
+                    resources=resources,
                 )
         else:
             sandbox = Sandbox.create(
                 timeout=sandbox_timeout_ms,
                 runtime=self._runtime,
-                resources=self._resource_constraints.to_vercel_resources(),
+                resources=resources,
             )
         self._attach_sandbox(sandbox, requested_cwd=self._requested_cwd)
 

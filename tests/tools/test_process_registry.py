@@ -390,7 +390,7 @@ class _NativeEnv:
                             "timeout": 30,
                             "task_id": "task-1",
                             "persistent_filesystem": True,
-                            "resource_constraints": {"cpu": 1, "disk": 51200},
+                            "resources": {"vcpus": 1, "memory": 2048},
                         }
                     ),
                 },
@@ -732,9 +732,9 @@ class TestCheckpoint:
             assert data[0]["background_checkpoint"]["backend"] == "vercel_sandbox"
             assert data[0]["background_checkpoint"]["command"] == "pytest -q"
             assert data[0]["background_checkpoint"]["command_id"] == "cmd_123"
-            assert data[0]["background_checkpoint"]["resource_constraints"] == {
-                "cpu": 1,
-                "disk": 51200,
+            assert data[0]["background_checkpoint"]["resources"] == {
+                "vcpus": 1,
+                "memory": 2048,
             }
 
     def test_recover_enqueues_watchers(self, registry, tmp_path):
@@ -908,7 +908,7 @@ class TestCheckpoint:
                     "timeout": 30,
                     "task_id": "task-1",
                     "persistent_filesystem": True,
-                    "resource_constraints": {"cpu": 1, "disk": 51200},
+                    "resources": {"vcpus": 1, "memory": 2048},
                 },
             }]))
         recovered_adapter = _EnvOwnedBackgroundAdapter(
@@ -998,7 +998,7 @@ class TestCheckpoint:
                 "timeout": 30,
                 "task_id": "task-1",
                 "persistent_filesystem": True,
-                "resource_constraints": {"cpu": 1, "disk": 51200},
+                "resources": {"vcpus": 1, "memory": 2048},
             },
         }]))
 
